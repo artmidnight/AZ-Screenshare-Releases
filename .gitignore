@@ -1,0 +1,3 @@
+# Installers go on the Releases page, not in git (GitHub refuses files over 100 MB)
+*.exe
+*.blockmap

@@ -1,0 +1,48 @@
+AZ Screenshare Freeware License
+Copyright (c) 2026 Art Midnight. All rights reserved.
+Contact: devartmidnight@gmail.com
+
+AZ Screenshare is free. This license explains what you may and may not do with it.
+By installing or using AZ Screenshare you accept this license.
+
+1. YOU MAY
+   a. Download, install and use AZ Screenshare for free, at home or at work,
+      including for streaming, recording and making videos, also when you earn
+      money from that content.
+   b. Install it on as many of your own computers as you like.
+   c. Share the official, unchanged installer for free, together with a link to
+      the official page: https://github.com/artmidnight/AZ-Screenshare-Releases
+
+2. YOU MAY NOT
+   a. Sell AZ Screenshare, charge any fee for it or for access to it, or put it
+      in a paid product, paid bundle or paid download.
+   b. Change, translate, decompile, disassemble, unpack or reverse engineer the
+      AZ Screenshare app, or copy or reuse its code, interface, design, name or
+      logo in another app, website or product.
+   c. Publish changed copies, rebranded copies, or apps based on AZ Screenshare.
+   d. Remove or change the name, logo, copyright, credits or this license.
+   e. Present AZ Screenshare, or anything made from it, as your own work.
+
+3. OTHER SOFTWARE INSIDE AZ SCREENSHARE
+   The installer also contains separate free and open source programs, each
+   under its own license: UxPlay (GPL-3.0), GStreamer and FFmpeg (LGPL-2.1),
+   and scrcpy with Android adb (Apache-2.0). Their licenses and source
+   information are in the install folder and in THIRD-PARTY-NOTICES on the
+   official page. Nothing in this license limits the rights those licenses give
+   you for those programs. Section 2 applies to the AZ Screenshare app itself
+   (its own code, interface, design, name and logo).
+
+4. TRADEMARKS
+   Apple, AirPlay, iPhone, iPad and Bonjour are trademarks of Apple Inc.
+   Android is a trademark of Google LLC. Other names belong to their owners.
+   AZ Screenshare is an independent app. It is not made, sponsored or approved
+   by Apple Inc. or Google LLC.
+
+5. NO WARRANTY
+   AZ Screenshare is provided "as is", without any warranty. Art Midnight is not
+   responsible for any damage or loss from using it, as far as the law allows.
+
+6. END
+   If you break this license, your right to use AZ Screenshare ends and you
+   must delete all copies. Art Midnight may update this license for new
+   versions.

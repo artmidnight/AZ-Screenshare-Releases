@@ -1,0 +1,253 @@
+diff --git a/lib/raop_buffer.c b/lib/raop_buffer.c
+index 45a3e4c..708a296 100644
+--- a/lib/raop_buffer.c
++++ b/lib/raop_buffer.c
+@@ -34,6 +34,10 @@
+ #include "byteutils.h"
+ 
+ #define RAOP_BUFFER_LENGTH 256
++/* AZ Screenshare: how many later packets may arrive while we wait for a missing one to be resent
++   (~0.26 s of AAC-ELD at ~92 packets/s). Upstream waited for a full buffer (256 = ~2.8 s), which played
++   2.8 s of silence at every new video when a packet number was never sent as audio. */
++#define AZ_RESEND_WAIT 24
+ 
+ typedef struct {
+     /* Data available */
+@@ -243,11 +247,12 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
+         /* If we do no resends, always return the first entry */
+     } else if (!entry->filled) {
+         /* Check how much we have space left in the buffer */
+-        if (entry_count < RAOP_BUFFER_LENGTH) {
++        if (entry_count < AZ_RESEND_WAIT) {
+             /* Return nothing and hope resend gets on time */
+             return NULL;
+         }
+-        /* Risk of buffer overrun, return empty buffer */
++        /* waited long enough for the resend: skip the missing packet */
++        logger_log(raop_buffer->logger, LOGGER_INFO, "AZAUDIO skipped_missing seq=%u", raop_buffer->first_seqnum);
+     }
+ 
+     /* Update buffer and validate entry */
+@@ -256,6 +261,10 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
+         return NULL;
+     }
+     entry->filled = 0;
++    if (!entry->payload_data) {
++        /* a "no data" packet held this number (see raop_buffer_mark_nodata): nothing to play, go on */
++        return raop_buffer_dequeue(raop_buffer, length, rtp_timestamp, seqnum, no_resend);
++    }
+ 
+     /* Return entry payload buffer */
+     *rtp_timestamp = entry->rtp_timestamp;
+@@ -267,6 +276,27 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
+     return data;
+ }
+ 
++/* AZ Screenshare: the client also sends "no data" packets, which use up a sequence number but carry no
++   audio and are not enqueued. Mark that number as done so the buffer does not wait for it to be resent.
++   Returns 1 when the number was inside the waiting window (it would have blocked playback). */
++int raop_buffer_mark_nodata(raop_buffer_t *raop_buffer, unsigned short seqnum) {
++    assert(raop_buffer);
++    if (raop_buffer->is_empty) return 0;
++    if (seqnum_cmp(seqnum, raop_buffer->first_seqnum) < 0) return 0;
++    if (seqnum_cmp(seqnum, raop_buffer->first_seqnum + RAOP_BUFFER_LENGTH) >= 0) return 0;
++    raop_buffer_entry_t *entry = &raop_buffer->entries[seqnum % RAOP_BUFFER_LENGTH];
++    if (entry->filled) return 0;
++    entry->seqnum = seqnum;
++    entry->rtp_timestamp = 0;
++    entry->filled = 1;
++    entry->payload_data = NULL;
++    entry->payload_size = 0;
++    if (seqnum_cmp(seqnum, raop_buffer->last_seqnum) > 0) {
++        raop_buffer->last_seqnum = seqnum;
++    }
++    return 1;
++}
++
+ void raop_buffer_handle_resends(raop_buffer_t *raop_buffer, raop_resend_cb_t resend_cb, void *opaque) {
+     assert(raop_buffer);
+     assert(resend_cb);
+diff --git a/lib/raop_buffer.h b/lib/raop_buffer.h
+index a3322da..19abcfd 100644
+--- a/lib/raop_buffer.h
++++ b/lib/raop_buffer.h
+@@ -32,6 +32,7 @@ int raop_buffer_enqueue(raop_buffer_t *raop_buffer, unsigned char *data, unsigne
+ void *raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *rtp_timestamp, unsigned short *seqnum, int no_resend);
+ void raop_buffer_handle_resends(raop_buffer_t *raop_buffer, raop_resend_cb_t resend_cb, void *opaque);
+ void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq);
++int raop_buffer_mark_nodata(raop_buffer_t *raop_buffer, unsigned short seqnum);
+ 
+ int raop_buffer_decrypt(raop_buffer_t *raop_buffer, unsigned char *data, unsigned char* output,
+                         unsigned int datalen, unsigned int *outputlen);
+diff --git a/lib/raop_rtp.c b/lib/raop_rtp.c
+index 64eb7fb..710f1b7 100644
+--- a/lib/raop_rtp.c
++++ b/lib/raop_rtp.c
+@@ -591,6 +591,11 @@ raop_rtp_thread_udp(void *arg)
+             if (packetlen == 12 ||(packetlen == 16 && memcmp(packet + 12, no_data_marker, 4) == 0)) {
+                 /* this is a "no data" packet */
+ 	        /* the first such packet could be used to provide the initial rtptime and seqnum formerly given in the RECORD request */
++                /* AZ Screenshare: it still uses a sequence number; tell the buffer, or playback waits ~2.8 s for it */
++                unsigned short nodata_seq = byteutils_get_short_be(packet, 2);
++                if (raop_buffer_mark_nodata(raop_rtp->buffer, nodata_seq)) {
++                    logger_log(raop_rtp->logger, LOGGER_INFO, "AZAUDIO nodata seq=%u", nodata_seq);
++                }
+                 continue;
+             }
+ 	    
+diff --git a/lib/raop_rtp_mirror.c b/lib/raop_rtp_mirror.c
+index 2efee1b..6efc850 100644
+--- a/lib/raop_rtp_mirror.c
++++ b/lib/raop_rtp_mirror.c
+@@ -39,6 +39,46 @@
+ #include "utils.h"
+ #include "plist/plist.h"
+ 
++/* AZ Screenshare: once a second, one "AZSTATS" info line with frames per second, data rate,
++   phone-to-PC delay (frame capture time on the phone vs arrival here, clocks synced by NTP),
++   codec and picture size. The app reads it to show live stats. */
++static uint64_t az_window_start = 0;
++static unsigned az_frames = 0;
++static uint64_t az_bytes = 0;
++static int64_t az_delay_sum = 0, az_delay_max = 0;
++static unsigned az_delay_count = 0;
++static int az_width = 0, az_height = 0;
++
++static void az_stats_frame(logger_t *logger, uint64_t now, uint64_t frame_time_local, int bytes, bool h265) {
++    if (!az_window_start) az_window_start = now;
++    az_frames++;
++    az_bytes += (uint64_t) bytes;
++    if (frame_time_local) {
++        /* a frame "arriving before it was captured" means the two clocks differ by a few ms: the delay is ~0 */
++        int64_t d = (int64_t) now - (int64_t) frame_time_local;
++        if (d < 0 && d > -200000000LL) d = 0;
++        if (d >= 0 && d < 10000000000LL) {   /* ignore far-off values (clocks not synced yet) */
++            az_delay_sum += d;
++            az_delay_count++;
++            if (d > az_delay_max) az_delay_max = d;
++        }
++    }
++    uint64_t span = now - az_window_start;
++    if (span >= 1000000000ULL) {
++        double secs = (double) span / 1e9;
++        logger_log(logger, LOGGER_INFO, "AZSTATS fps=%.1f kbps=%.0f delay_ms=%.0f delay_max_ms=%.0f codec=%s width=%d height=%d",
++                   az_frames / secs, (double) az_bytes * 8.0 / 1000.0 / secs,
++                   az_delay_count ? (double) az_delay_sum / az_delay_count / 1e6 : -1.0,
++                   az_delay_count ? (double) az_delay_max / 1e6 : -1.0,
++                   h265 ? "h265" : "h264", az_width, az_height);
++        az_window_start = now;
++        az_frames = 0;
++        az_bytes = 0;
++        az_delay_sum = az_delay_max = 0;
++        az_delay_count = 0;
++    }
++}
++
+ #ifdef _WIN32
+ #define CAST (char *)
+ /* are these keepalive settings for WIN32 correct? */
+@@ -558,6 +598,7 @@ raop_rtp_mirror_thread(void *arg)
+                 }
+ 
+                 raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, &video_data);
++                az_stats_frame(raop_rtp_mirror->logger, raop_ntp_get_local_time(), ntp_timestamp_local, payload_size, h265_video);
+                 free(payload_out);
+                 break;
+             case 0x01:
+@@ -610,6 +651,8 @@ raop_rtp_mirror_thread(void *arg)
+                            " %f != width_source = %f, height_source = %f", width_0, height_0, width_source, height_source);
+                 }
+                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror: unidentified extra header data  %f, %f", unknown_w, unknown_h);
++                az_width = (int) width;
++                az_height = (int) height;
+                 if (raop_rtp_mirror->callbacks.video_report_size) {
+                     raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, &width_source, &height_source, &width, &height);
+                 }
+diff --git a/renderers/audio_renderer.c b/renderers/audio_renderer.c
+index ddcd14e..1a77de8 100644
+--- a/renderers/audio_renderer.c
++++ b/renderers/audio_renderer.c
+@@ -52,6 +52,14 @@ typedef struct audio_renderer_s {
+ static audio_renderer_t *renderer_type[NFORMATS];
+ static audio_renderer_t *renderer = NULL;
+ 
++/* AZ Screenshare sound diagnostics: once a second "AZAUDIO pkts=N level_db=X" (sound packets received and the
++   loudest level the "level" element measured just before the speakers, -200 = no measurement), and
++   "AZAUDIO gap_ms=N" when packets resume after a pause of over 0.3 s. Shows whether a silent start comes
++   from the phone (silent packets / no packets) or from playback here (loud packets, nothing heard). */
++static gint64 az_a_window = 0, az_a_last = 0;
++static int az_a_pkts = 0;
++static double az_a_peak_db = -200.0;
++
+ /* GStreamer Caps strings for Airplay-defined audio compression types (ct) */
+ 
+ /* ct = 1; linear PCM (uncompressed): 44100/16/2, S16LE */
+@@ -309,6 +317,22 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
+ 
+     if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
+ 
++    {   /* AZ Screenshare sound diagnostics (see top of file) */
++        gint64 now = g_get_monotonic_time();
++        if (az_a_last && now - az_a_last > 300000) {
++            logger_log(logger, LOGGER_INFO, "AZAUDIO gap_ms=%lld", (long long) ((now - az_a_last) / 1000));
++        }
++        az_a_last = now;
++        az_a_pkts++;
++        if (!az_a_window) az_a_window = now;
++        if (now - az_a_window >= 1000000) {
++            logger_log(logger, LOGGER_INFO, "AZAUDIO pkts=%d level_db=%.0f", az_a_pkts, az_a_peak_db);
++            az_a_window = now;
++            az_a_pkts = 0;
++            az_a_peak_db = -200.0;
++        }
++    }
++
+     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
+     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
+     if (sync) {
+@@ -418,9 +442,23 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
+     case GST_MESSAGE_EOS:
+         logger_log(logger, LOGGER_INFO, "GStreamer: End-Of-Stream (audio)");
+         break;
+-    case GST_MESSAGE_ELEMENT:
++    case GST_MESSAGE_ELEMENT: {
+       // many "level" messages may be sent
++        const GstStructure *s = gst_message_get_structure(message);
++        if (s && gst_structure_has_name(s, "level")) {
++            const GValue *v = gst_structure_get_value(s, "rms");
++            if (v && G_VALUE_HOLDS_BOXED(v)) {
++G_GNUC_BEGIN_IGNORE_DEPRECATIONS
++                GValueArray *arr = (GValueArray *) g_value_get_boxed(v);
++                for (guint i = 0; arr && i < arr->n_values; i++) {
++                    double db = g_value_get_double(g_value_array_get_nth(arr, i));
++                    if (db > az_a_peak_db) az_a_peak_db = db;
++                }
++G_GNUC_END_IGNORE_DEPRECATIONS
++            }
++        }
+         break;
++    }
+     default:
+         /* unhandled message */
+         logger_log(logger, LOGGER_DEBUG,"GStreamer unhandled audio bus message: src = %s type = %s",
+diff --git a/uxplay.cpp b/uxplay.cpp
+index fad6c1e..94646fe 100644
+--- a/uxplay.cpp
++++ b/uxplay.cpp
+@@ -2224,14 +2224,14 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
+ 
+ extern "C" void conn_init (void *cls) {
+     open_connections++;
+-    LOGD("Open connections: %i", open_connections);
++    LOGI("Open connections: %i", open_connections);
+     //video_renderer_update_background(1);
+ }
+ 
+ extern "C" void conn_destroy (void *cls) {
+     //video_renderer_update_background(-1);
+     open_connections--;
+-    LOGD("Open connections: %i", open_connections);
++    LOGI("Open connections: %i", open_connections);
+     if (open_connections == 0) {
+         remote_clock_offset = 0;
+         if (use_audio) {
